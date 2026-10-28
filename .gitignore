@@ -1,0 +1,11 @@
+# Python bytecode caches
+__pycache__/
+*.py[cod]
+
+# Local training and evaluation datasets
+/edu_fineweb10B/
+/edu_fineweb3B/
+/hellaswag/
+
+# Experiment outputs, logs, source snapshots, and model checkpoints
+/log/
