@@ -4,6 +4,7 @@
 测试训练结果：加上 --checkpoint log/full_swiglu_rmsnorm/model_final.pt。
 KV cache 入口留给你实现：generate_with_kv_cache。
 不指定 --checkpoint 时仍使用随机权重，便于单独做推理实现实验。
+支持 train_experiment.py 的 tied / untied 检查点，按保存的模式恢复参数共享关系。
 """
 
 import argparse
@@ -230,10 +231,55 @@ def benchmark(model, tokens, generate_fn, max_new_tokens, warmup=1, runs=3, **kw
     return output
 
 
+def load_checkpoint_model(checkpoint_path):
+    """在 CPU 恢复权重及共享关系，同时兼容旧版 GPTConfig 检查点。"""
+    # 旧 train.py 保存的类名是 __main__.GPTConfig；无需导入训练脚本。
+    # 新实验检查点只用字典、基础类型和 Tensor，可保持 weights_only=True。
+    with torch.serialization.safe_globals([(GPTConfig, "__main__.GPTConfig")]):
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    config = checkpoint["config"]
+    if isinstance(config, dict):
+        config = GPTConfig(**config)
+    if not isinstance(config, GPTConfig):
+        raise ValueError("检查点 config 必须是 GPTConfig 或对应字段的字典")
+
+    experiment_mode = checkpoint.get("experiment_mode", "tied")
+    if experiment_mode not in {"tied", "untied_clone", "untied_random"}:
+        raise ValueError(f"未知的检查点实验模式: {experiment_mode!r}")
+    state = checkpoint["model"]
+    saved_e = state["transformer.wte.weight"]
+    saved_u = state["lm_head.weight"]
+    tied = experiment_mode == "tied"
+    if tied and not torch.equal(saved_e, saved_u):
+        raise ValueError(
+            "检查点声明 tied（旧检查点缺少 experiment_mode 时默认 tied），"
+            "但 E/U 权重不同；拒绝把两套权重加载到同一 Parameter。"
+        )
+
+    model = GPT(config)
+    if not tied:
+        # 必须在 load_state_dict 前解除共享；strict=True 不检查参数是否共享。
+        model.lm_head.weight = nn.Parameter(model.transformer.wte.weight.detach().clone())
+    model.load_state_dict(state, strict=True)
+    e = model.transformer.wte.weight
+    u = model.lm_head.weight
+    if (e is u) != tied or (e.data_ptr() == u.data_ptr()) != tied:
+        raise RuntimeError("恢复后的 E/U 参数共享关系与检查点模式不一致")
+    if not torch.equal(e.detach(), saved_e) or not torch.equal(u.detach(), saved_u):
+        raise RuntimeError("恢复后的 E/U 权重与检查点不一致")
+
+    # 不把 optimizer 等训练状态带入推理流程，函数返回后释放其 CPU 内存。
+    info = {
+        "step": checkpoint.get("completed_steps", checkpoint.get("step")),
+        "experiment_mode": experiment_mode,
+    }
+    return model, info
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("no_cache", "kv_cache"), default="no_cache")
-    parser.add_argument("--checkpoint", help="train.py 保存的 .pt 权重路径；不指定则使用随机权重")
+    parser.add_argument("--checkpoint", help="train.py 或 train_experiment.py 保存的 .pt 路径")
     parser.add_argument("--prompt", default="Hello, I'm a language model,")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -257,23 +303,17 @@ def main():
 
     enc = tiktoken.get_encoding("gpt2")
     prompt_tokens = enc.encode(args.prompt)
-    checkpoint = None
+    checkpoint_info = None
     if args.checkpoint:
-        # train.py 直接运行时，保存的配置类名是 __main__.GPTConfig。
-        # 映射到本文件的同名类，不导入会启动训练的 train.py。
-        with torch.serialization.safe_globals([(GPTConfig, "__main__.GPTConfig")]):
-            checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-        config = checkpoint["config"]
+        model, checkpoint_info = load_checkpoint_model(args.checkpoint)
     else:
-        config = GPTConfig(vocab_size=50304)  # 与 train.py 实际实例化的配置一致。
-    if not prompt_tokens or len(prompt_tokens) + args.max_new_tokens > config.block_size:
+        model = GPT(GPTConfig(vocab_size=50304))  # 与 train.py 实际实例化的配置一致。
+    if not prompt_tokens or len(prompt_tokens) + args.max_new_tokens > model.config.block_size:
         parser.error("prompt 不能为空，且 prompt 长度 + max-new-tokens 不能超过 block_size")
-    model = GPT(config)
-    if checkpoint is not None:
-        model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device).eval()
-    if checkpoint is not None:
-        print(f"已加载训练权重: {args.checkpoint}，checkpoint step={checkpoint['step']}")
+    if checkpoint_info is not None:
+        print(f"已加载训练权重: {args.checkpoint}，checkpoint step={checkpoint_info['step']}，"
+              f"experiment_mode={checkpoint_info['experiment_mode']}")
     else:
         print("当前使用随机初始化权重，仅用于跑通推理和测速，生成文本没有训练效果。")
     print(f"device={device}, mode={args.mode}, batch_size={args.batch_size}, "

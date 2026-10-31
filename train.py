@@ -176,7 +176,7 @@ class DataLoaderLite:
         assert split in {'train', 'val'}
 
         # get the shard filenames
-        data_root = os.environ.get("DATA_ROOT", "edu_fineweb3B")
+        data_root = os.environ.get("DATA_ROOT", "edu_fineweb10B")
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s and s.endswith(".npy")]
         shards = sorted(shards)
@@ -235,8 +235,9 @@ def get_most_likely_row(tokens, mask, logits):
 # -----------------------------------------------------------------------------
 # simple launch:
 # python3 train.py
-# 2 x RTX 4090; physical GPUs 2,3 map to local ranks 0,1:
-# CUDA_VISIBLE_DEVICES=2,3 torchrun --standalone --nproc_per_node=2 train.py
+# Four physical GPUs 0,4,5,6 become local cuda:0,1,2,3 for DDP:
+# CUDA_VISIBLE_DEVICES=0,4,5,6 torchrun --standalone --nproc_per_node=4 train.py
+# The embedding experiment uses train_experiment.py; keep LOCAL_RANK as the device index.
 
 # run the training loop
 from torch.distributed import init_process_group, destroy_process_group
@@ -280,14 +281,14 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 16 # micro batch size per GPU, sized for a 24 GiB RTX 4090
+B = 16 # micro batch size per GPU
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> B={B}, T={T}, GPUs={ddp_world_size}, gradient accumulation steps: {grad_accum_steps}")
-    # Q = B * T * GPUs * A = 16 * 1024 * 2 * 16 = 524288 tokens/update.
+    # Q = B * T * ddp_world_size * grad_accum_steps = 524288 tokens/update.
 
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
@@ -307,8 +308,8 @@ raw_model = model.module if ddp else model # always contains the "raw" unwrapped
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 207 # keep the original ~3.75% warmup ratio: round(5532 * 715 / 19073)
-max_steps = 5532 # ceil(2.9B / 524288), ~1 epoch; the other 100M tokens are validation
+warmup_steps = 715
+max_steps = 19073 # ~10B training tokens, matching build-nanogpt's training budget
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:

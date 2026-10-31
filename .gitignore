@@ -9,3 +9,6 @@ __pycache__/
 
 # Experiment outputs, logs, source snapshots, and model checkpoints
 /log/
+
+# Local experiment design, discussion notes, and draft analyses
+/experiment_design/

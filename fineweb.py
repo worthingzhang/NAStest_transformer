@@ -1,117 +1,167 @@
-"""
-FineWeb-Edu dataset (for srs pretraining)
-https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu
-Tokenizes downloaded local data and saves data shards to disk.
-Run simply as:
-$ python3 fineweb.py
-Reads the completed Parquet files from the existing download cache under /tmp.
-Keeps 30 shards (100M validation + 2.9B training tokens) in "edu_fineweb3B".
-After success, deletes that private cache; the uint16 output is about 6 GB.
+"""Tokenize local FineWeb-Edu sample-10BT Parquet files into GPT-2 shards.
+
+Run from the project directory: python3 -u fineweb.py
+Use --parquet-dir to select a different local copy. Only the text column is
+read, one bounded batch at a time; no full-dataset Arrow cache is created.
 """
 
-import os
+import argparse
+import json
 import multiprocessing as mp
-import shutil
-from glob import glob
+import os
+from pathlib import Path
+import time
+
 import numpy as np
+import pyarrow.parquet as pq
 import tiktoken
 
-# Share a writable tokenizer cache with train.py, outside the disposable data cache.
-os.environ.setdefault("TIKTOKEN_CACHE_DIR", os.path.expanduser("~/.cache/tiktoken"))
 
-# Reuse the interrupted download; keep any Arrow conversion cache on /tmp too.
-download_cache = "/tmp/fineweb-10b-0wr5c827"
-os.environ["HF_HUB_CACHE"] = os.path.join(download_cache, "hub")
-os.environ["HF_DATASETS_CACHE"] = os.path.join(download_cache, "datasets")
-os.environ["HF_XET_CACHE"] = os.path.join(download_cache, "xet")
-print(f"Using existing download cache: {download_cache}", flush=True)
-from datasets import load_dataset # pip install datasets
-from tqdm import tqdm # pip install tqdm
+ROOT = Path(__file__).resolve().parent
+REVISION = "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"
+DEFAULT_SOURCE = (ROOT / "log/huggingface/hub/datasets--HuggingFaceFW--fineweb-edu"
+                  / "snapshots" / REVISION / "sample/10BT")
+enc = None
 
-# ------------------------------------------
-local_dir = "edu_fineweb3B"
-shard_size = int(1e8) # 100M tokens per shard
-max_shards = 30 # keep 3B tokens in total; shard 0 is validation
 
-# create the cache the local directory if it doesn't exist yet
-DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
-os.makedirs(DATA_CACHE_DIR, exist_ok=True)
+def init_tokenizer():
+    global enc
+    enc = tiktoken.get_encoding("gpt2")
 
-# Snapshot paths contain completed downloads, not the .incomplete files in blobs.
-parquet_files = sorted(glob(os.path.join(
-    download_cache, "hub/datasets--HuggingFaceFW--fineweb-edu",
-    "snapshots/*/sample/10BT/*.parquet",
-)))
-if not parquet_files:
-    raise FileNotFoundError(f"No downloaded Parquet files found in {download_cache}")
-print(f"Reading {len(parquet_files)} local Parquet files; keeping {max_shards * shard_size:,} tokens.", flush=True)
-fw = load_dataset(
-    "parquet", data_files=parquet_files, split="train", columns=["text"],
-    cache_dir=os.path.join(download_cache, "datasets"),
-)
 
-# init the tokenizer
-enc = tiktoken.get_encoding("gpt2")
-eot = enc._special_tokens['<|endoftext|>'] # end of text token
-def tokenize(doc):
-    # tokenizes a single document and returns a numpy array of uint16 tokens
-    tokens = [eot] # the special <|endoftext|> token delimits all documents
-    tokens.extend(enc.encode_ordinary(doc["text"]))
-    tokens_np = np.array(tokens)
-    assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
-    tokens_np_uint16 = tokens_np.astype(np.uint16)
-    return tokens_np_uint16
+def tokenize(text):
+    # Keep empty documents: each source row contributes one leading EOT.
+    if not isinstance(text, str):
+        raise ValueError("Expected a string in the Parquet text column")
+    tokens = [enc.eot_token]
+    tokens.extend(enc.encode_ordinary(text))
+    return np.asarray(tokens, dtype=np.uint16)
 
-def write_datafile(filename, tokens_np):
-    np.save(filename, tokens_np)
 
-# tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
-nprocs = max(1, os.cpu_count()//2)
-with mp.Pool(nprocs) as pool:
-    shard_index = 0
-    # preallocate buffer to hold current shard
-    all_tokens_np = np.empty((shard_size,), dtype=np.uint16)
-    token_count = 0
-    progress_bar = None
-    for tokens in pool.imap(tokenize, fw, chunksize=16):
+def write_json(path, value):
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    temporary.replace(path)
 
-        # is there enough space in the current shard for the new tokens?
-        if token_count + len(tokens) < shard_size:
-            # simply append tokens to current shard
-            all_tokens_np[token_count:token_count+len(tokens)] = tokens
-            token_count += len(tokens)
-            # update progress bar
-            if progress_bar is None:
-                progress_bar = tqdm(total=shard_size, unit="tokens", desc=f"Shard {shard_index}")
-            progress_bar.update(len(tokens))
-        else:
-            # write the current shard and start a new one
-            split = "val" if shard_index == 0 else "train"
-            filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}")
-            # split the document into whatever fits in this shard; the remainder goes to next one
-            remainder = shard_size - token_count
-            progress_bar.update(remainder)
-            all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
-            write_datafile(filename, all_tokens_np)
-            shard_index += 1
-            progress_bar.close()
-            progress_bar = None
-            if shard_index == max_shards:
-                token_count = 0 # do not write a 31st, partial shard below
-                break
-            # populate the next shard with the leftovers of the current doc
-            all_tokens_np[0:len(tokens)-remainder] = tokens[remainder:]
-            token_count = len(tokens)-remainder
 
-    # write any remaining tokens as the last shard
-    if token_count != 0:
-        split = "val" if shard_index == 0 else "train"
-        filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}")
-        write_datafile(filename, all_tokens_np[:token_count])
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--parquet-dir", type=Path, default=DEFAULT_SOURCE)
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "edu_fineweb10B")
+    parser.add_argument("--workers", type=int, default=min(32, max(1, (os.cpu_count() or 1) // 2)))
+    parser.add_argument("--batch-size", type=int, default=8192, help="Maximum documents held per batch")
+    parser.add_argument("--shard-size", type=int, default=100_000_000, help="Tokens per shard")
+    args = parser.parse_args()
+    if min(args.workers, args.batch_size, args.shard_size) < 1:
+        parser.error("workers, batch-size and shard-size must be positive")
 
-# Delete only this preparation's private cache, after all requested shards are saved.
-if shard_index != max_shards:
-    raise RuntimeError(f"Source ended before {max_shards} full shards; cache kept at {download_cache}")
-del fw
-shutil.rmtree(download_cache)
-print(f"Done: {max_shards} shards saved to {DATA_CACHE_DIR}; private cache deleted.")
+    files = sorted(args.parquet_dir.glob("*.parquet"))
+    if not files:
+        parser.error(f"No local Parquet files in {args.parquet_dir}; provide --parquet-dir")
+    source = []
+    for path in files:
+        parquet = pq.ParquetFile(path)
+        if "text" not in parquet.schema_arrow.names:
+            raise ValueError(f"Missing text column: {path}")
+        source.append({"name": path.name, "size_bytes": path.stat().st_size,
+                       "rows": parquet.metadata.num_rows, "cache_blob": path.resolve().name})
+        parquet.close()
+    expected_documents = sum(item["rows"] for item in source)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if any(args.output_dir.iterdir()):
+        raise FileExistsError(f"Output directory must be empty: {args.output_dir}")
+    # Exclusive creation also prevents two preparation jobs using the same output.
+    lock = args.output_dir / ".prepare.lock"
+    with lock.open("x") as stream:
+        stream.write(f"{os.getpid()}\n")
+
+    os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(ROOT / "log/tiktoken_cache"))
+    started = time.time()
+    manifest_path = args.output_dir / "preparation.json"
+    manifest = {
+        "status": "running", "dataset": "HuggingFaceFW/fineweb-edu",
+        "subset": "sample-10BT", "source_directory": str(args.parquet_dir.resolve()),
+        "source_files": source, "expected_documents": expected_documents,
+        "tokenizer": "tiktoken/gpt2", "tiktoken_version": tiktoken.__version__,
+        "document_prefix": 50256, "encoding": "encode_ordinary", "dtype": "uint16",
+        "shard_size": args.shard_size, "validation_shard_index": 0,
+        "workers": args.workers, "batch_size": args.batch_size,
+        "documents": 0, "total_tokens": 0, "shards": [],
+    }
+    write_json(manifest_path, manifest)
+    print(f"Source: {args.parquet_dir.resolve()}", flush=True)
+    print(f"Files: {len(files)}, documents: {expected_documents:,}, workers: {args.workers}", flush=True)
+    print(f"Output: {args.output_dir.resolve()}", flush=True)
+
+    def save_shard(tokens):
+        index = len(manifest["shards"])
+        split = "val" if index == 0 else "train"
+        name = f"edufineweb_{split}_{index:06d}.npy"
+        path = args.output_dir / name
+        temporary = path.with_suffix(".npy.tmp")
+        with temporary.open("xb") as stream:
+            np.save(stream, tokens, allow_pickle=False)
+        temporary.replace(path)
+        manifest["shards"].append({"name": name, "split": split, "tokens": len(tokens)})
+        print(f"Saved {name}: {len(tokens):,} tokens", flush=True)
+
+    try:
+        init_tokenizer()
+        if enc.n_vocab != 50257 or enc.eot_token != 50256:
+            raise ValueError("Unexpected GPT-2 vocabulary")
+        # Spawn avoids inheriting Arrow's thread state. Each worker loads GPT-2 once.
+        with mp.get_context("spawn").Pool(args.workers, initializer=init_tokenizer) as pool:
+            buffer = np.empty(args.shard_size, dtype=np.uint16)
+            used = 0
+            last_report = started
+            for file_index, path in enumerate(files):
+                print(f"Reading {file_index + 1}/{len(files)}: {path.name}", flush=True)
+                with pq.ParquetFile(path) as parquet:
+                    for batch in parquet.iter_batches(batch_size=args.batch_size,
+                                                       columns=["text"], use_threads=False):
+                        # map preserves row order; finishing each batch bounds prefetch/results.
+                        results = pool.map(tokenize, batch.column(0).to_pylist(), chunksize=16)
+                        for tokens in results:
+                            offset = 0
+                            while offset < len(tokens):
+                                take = min(args.shard_size - used, len(tokens) - offset)
+                                buffer[used:used + take] = tokens[offset:offset + take]
+                                used += take
+                                offset += take
+                                if used == args.shard_size:
+                                    save_shard(buffer)
+                                    used = 0
+                            manifest["documents"] += 1
+                            manifest["total_tokens"] += len(tokens)
+                        now = time.time()
+                        if now - last_report >= 30:
+                            manifest["elapsed_seconds"] = now - started
+                            write_json(manifest_path, manifest)
+                            rate = manifest["total_tokens"] / (now - started)
+                            print(f"Progress: {manifest['documents']:,}/{expected_documents:,} documents, "
+                                  f"{manifest['total_tokens']:,} tokens, {rate:,.0f} tokens/s", flush=True)
+                            last_report = now
+            if used:
+                save_shard(buffer[:used])
+        if manifest["documents"] != expected_documents:
+            raise RuntimeError("Processed document count differs from source metadata")
+        if sum(item["tokens"] for item in manifest["shards"]) != manifest["total_tokens"]:
+            raise RuntimeError("Shard token count differs from tokenizer output")
+        manifest["status"] = "complete"
+        manifest["elapsed_seconds"] = time.time() - started
+        write_json(manifest_path, manifest)
+        print(f"Complete: {manifest['documents']:,} documents, {manifest['total_tokens']:,} tokens, "
+              f"{len(manifest['shards'])} shards", flush=True)
+    except BaseException as error:
+        manifest["status"] = "failed"
+        manifest["error"] = f"{type(error).__name__}: {error}"
+        manifest["elapsed_seconds"] = time.time() - started
+        write_json(manifest_path, manifest)
+        raise
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    main()
